@@ -1,0 +1,18 @@
+# Plik .gitignore
+
+# Models YOLOv8
+*.pt
+*.onnx
+*.engine
+
+# Catalog cache Ultralytics
+.cache/
+
+# Enviroment Virtual
+venv/
+.venv/
+
+# System files of Python
+__pycache__/
+*.pyc
+.DS_Store
