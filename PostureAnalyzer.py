@@ -1,100 +1,110 @@
+# --- Plik: PostureAnalyzer.py (FINALNY KOD) ---
 import numpy as np
-import math
+import time
 
 class PostureAnalyzer:
     """
-    Klasa do analizowania kluczowych punktów zwróconych przez model Pose Estimation 
-    i oceniania, czy postawa jest zgarbiona (Slouching).
+    Analizator postawy, który oblicza uśredniony kąt pochylenia (0 st. na 12stej, mierzy przeciwnie do ruchu wskazówek)
+    i monitoruje bezruch.
     """
     
-    # Indeksy kluczowych punktów w modelu YOLOv8-Pose
-    R_EAR_IDX = 3
-    L_EAR_IDX = 4
-    R_SHOULDER_IDX = 5
-    L_SHOULDER_IDX = 6
-    
-    def __init__(self, threshold_deg=25):
-        """
-        Inicjalizacja analizatora z domyślnym progiem dla złej postawy.
-        :param threshold_deg: Kąt (w stopniach) powyżej którego postawa jest uznawana za złą.
-        """
-        self.threshold_deg = threshold_deg
+    def __init__(self, threshold_deg=20, inactivity_time_sec=5, position_threshold_px=10):
+        # Próg odchylenia (np. 20 stopni od 0/360)
+        self.threshold_deg = threshold_deg 
+        self.inactivity_time_sec = inactivity_time_sec
+        self.position_threshold_px = position_threshold_px
+        
+        # Zmienne do śledzenia bezruchu
+        self.last_position = None
+        self.last_move_time = time.time()
+        self.is_inactivity_warning = False
 
-    def calculate_tilt_angle(self, p_ear, p_shoulder):
+    def calculate_angle_360(self, p1, p2):
         """
-        Oblicza kąt nachylenia linii Ucho (p_ear) - Ramię (p_shoulder) względem osi pionowej.
-        Używa cosinusa kąta między wektorem Ucho->Ramię a wektorem pionowym (0, -1).
-        Wektor Ucho->Ramię: v_arm = p_shoulder - p_ear
-        Wektor Pionowy: v_vertical = (0, 1) lub (0, -1) - dowolny pionowy.
-        Zwraca kąt (w stopniach) odchylenia od pionu.
+        Oblicza kąt wektora P1->P2 (ramię do ucha) względem pionu (0 stopni na 12stej).
+        Mierzy przeciwnie do ruchu wskazówek zegara.
+        UWZGLĘDNIA FLIP KAMERY O 180 STOPNI (flip_method=2).
         """
+        v = p2 - p1 # Wektor od ramienia (P1) do ucha (P2)
         
-        p_ear = np.array(p_ear)      # Ucho
-        p_shoulder = np.array(p_shoulder)  # Ramię
+        # KORYGUJEMY OBRÓT 180 STOPNI:
+        # Odwracamy znak obu składowych wektora V
+        vx_corrected = -v[0]
+        vy_corrected = -v[1]
         
-        # 1. Wektor od Ucha do Ramienia (kierunek, w którym jest ramię od głowy)
-        v_head_arm = p_shoulder - p_ear
+        # atan2(x, y) - to daje nam 0 na 12:00 i mierzy zgodnie z ruchem wskazówek
+        # atan2(y, x) - to mierzy przeciwnie
         
-        # 2. Wektor Pionowy (w kierunku w dół)
-        # Musimy użyć pionowego wektora, żeby porównać z nim nachylenie szyi/głowy
-        # Zwykle to po prostu (0, 1), zakładając, że Y rośnie w dół w OpenCV
-        v_vertical = np.array([0, 1]) 
-        
-        # 3. Iloczyn skalarny i normy
-        dot_product = np.dot(v_head_arm, v_vertical)
-        magnitude_v_head_arm = np.linalg.norm(v_head_arm)
-        magnitude_v_vertical = np.linalg.norm(v_vertical)
-
-        # Obliczenie cosinusa kąta
-        if magnitude_v_head_arm == 0:
-            return 0.0
-            
-        cosine_angle = dot_product / (magnitude_v_head_arm * magnitude_v_vertical)
-        
-        # 4. Kąt w radianach i stopniach
-        # Kąt jest mierzony od wektora pionowego. Kąt bliski 0 oznacza, że Ucho jest nad Ramieniem (dobra postawa).
-        angle_rad = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+        # Używamy kombinacji, która daje 0 na 12:00 i mierzy przeciwnie do ruchu wskazówek
+        angle_rad = np.arctan2(vx_corrected, vy_corrected) 
         angle_deg = np.degrees(angle_rad)
         
-        # Idealna postawa (prosto w dół) to kąt bliski 0°
-        # Zgarbiona postawa to kąt bliski 90° lub więcej.
-        
-        # Aby postawa była prosta, wektor Ucho->Ramię (v_head_arm) powinien być skierowany pionowo (kąt 0°)
-        # Gdy się garbisz, Ucho przesuwa się do przodu, a kąt względem pionu rośnie.
-        # W widoku z profilu, gdy jest prosto, wektor v_head_arm jest w dół, a kąt jest bliski 0 stopni.
-        # Jeśli Ucho się wysuwa (garbienie), kąt rośnie, np. do 25 stopni lub więcej.
-
-        # Wymuszamy, aby mierzyć odchylenie od osi pionowej w dół, co jest prawidłowe dla postawy.
+        # Normalizacja do zakresu 0-360
+        if angle_deg < 0:
+            angle_deg += 360
+            
         return angle_deg
 
     def check_slouching(self, keypoints):
         """
-        Ocenia, czy postawa jest zgarbiona, mierząc nachylenie linii Ucho-Ramię.
-
-        :param keypoints: Macierz kluczowych punktów dla jednej osoby [33, 3 (x, y, conf)].
-        :return: Tuple (is_slouching, angle), gdzie is_slouching to bool.
+        Analizuje postawę i bezruch.
+        Zwraca: (is_slouching, angle_avg, is_inactivity_warning)
         """
+        # --- 1. Obliczenie Kątów ---
+        angles = []
         
-        current_angle = 0.0
-        detected = False
+        # Indeksy keypoints: 3: ear(L), 4: ear(R), 5: shoulder(L), 6: shoulder(R)
         
-        # --- 1. Próba użycia Prawy Profil ---
-        if keypoints[self.R_EAR_IDX, 2] > 0.5 and keypoints[self.R_SHOULDER_IDX, 2] > 0.5:
-            p_ear = keypoints[self.R_EAR_IDX, :2]
-            p_shoulder = keypoints[self.R_SHOULDER_IDX, :2]
-            current_angle = self.calculate_tilt_angle(p_ear, p_shoulder)
-            detected = True
-        
-        # --- 2. Próba użycia Lewy Profil ---
-        elif keypoints[self.L_EAR_IDX, 2] > 0.5 and keypoints[self.L_SHOULDER_IDX, 2] > 0.5:
-            p_ear = keypoints[self.L_EAR_IDX, :2]
-            p_shoulder = keypoints[self.L_SHOULDER_IDX, :2]
-            current_angle = self.calculate_tilt_angle(p_ear, p_shoulder)
-            detected = True
+        # Lewa strona
+        ear_L = keypoints[3]
+        shoulder_L = keypoints[5]
+        if ear_L[2] > 0.1 and shoulder_L[2] > 0.1: 
+             angle_L = self.calculate_angle_360(shoulder_L[:2], ear_L[:2])
+             angles.append(angle_L)
 
-        # Ocena postawy
-        if detected:
-            is_slouching = current_angle > self.threshold_deg
-            return is_slouching, current_angle
+        # Prawa strona
+        ear_R = keypoints[4]
+        shoulder_R = keypoints[6]
+        if ear_R[2] > 0.1 and shoulder_R[2] > 0.1: 
+             angle_R = self.calculate_angle_360(shoulder_R[:2], ear_R[:2])
+             angles.append(angle_R)
+
+        # Uśrednianie kątów
+        if angles:
+            angle_avg = np.mean(angles)
+        else:
+            angle_avg = 0.0
+            
+        # Weryfikacja garbienia
+        # Obliczamy, jak daleko kąt jest od pionu (0/360)
+        distance_from_vertical = min(angle_avg, 360 - angle_avg)
         
-        return False, 0.0 # Jeśli punkty nie zostały wykryte lub mają niską pewność
+        # Zła postawa, gdy odchylenie od pionu jest większe niż próg (np. 20 stopni)
+        is_slouching = distance_from_vertical > self.threshold_deg 
+        
+        # --- 2. LOGIKA BEZRUCHU ---
+        
+        current_position_full = ear_L if ear_L[2] > ear_R[2] else ear_R
+        
+        if current_position_full[2] < 0.1: 
+             current_position_coords = np.array([0, 0])
+        else:
+             current_position_coords = current_position_full[:2] 
+        
+        if self.last_position is None:
+            self.last_position = current_position_coords
+            self.last_move_time = time.time()
+            self.is_inactivity_warning = False
+        else:
+            distance = np.linalg.norm(current_position_coords - self.last_position)
+            
+            if distance > self.position_threshold_px:
+                self.last_position = current_position_coords
+                self.last_move_time = time.time()
+                self.is_inactivity_warning = False
+            else:
+                inactivity_duration = time.time() - self.last_move_time
+                if inactivity_duration > self.inactivity_time_sec:
+                    self.is_inactivity_warning = True
+                
+        return is_slouching, angle_avg, self.is_inactivity_warning
